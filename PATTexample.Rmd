@@ -22,6 +22,9 @@ expit<-function(x){
 return(exp(x)/(1+exp(x)))
 }
 
+
+### simulating the population data ###
+# provided here for reproducibility
 # load('psam_pus_combined.rda')
 # 
 # acs_mi = psam_pus_combined %>% filter( ST == 26) %>% filter ( !is.na(AGEP)) %>% filter ( !is.na(PWGTP))%>% select(PWGTP, AGEP)

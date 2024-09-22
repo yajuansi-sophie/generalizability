@@ -1,0 +1,192 @@
+---
+title: "Case study of estimating PATT"
+author: "Yajuan Si and Michael Elliott"
+date: "2024-09-24"
+output: html_document
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE)
+```
+
+## Generalizability
+
+
+```{r rct}
+library("BART")
+library("survey")
+library(tidyverse)
+library(pps)
+
+expit<-function(x){
+return(exp(x)/(1+exp(x)))
+}
+
+# load('psam_pus_combined.rda')
+# 
+# acs_mi = psam_pus_combined %>% filter( ST == 26) %>% filter ( !is.na(AGEP)) %>% filter ( !is.na(PWGTP))%>% select(PWGTP, AGEP)
+# 
+# N = dim(acs_mi)[1]
+# 
+# 
+# # acs_use = acs_mi %>% mutate(
+# #   X = ifelse(AGEP >= 65, 1, 0),
+# #   wts = PWGTP,
+# #   Y = (abs(PINCP))**(1/3) * sign(PINCP)
+# # ) %>% select(X, wts, Y,PINCP)
+# 
+#   population <- data.frame(index = c(1:N),
+#                            M = acs_mi$PWGTP,
+#                            X = scale(acs_mi$AGEP),
+#                            Y1 = rep(NA, N),
+#                            Y2 = rep(NA, N),
+#                            p = rep(NA, N))
+#  
+#  nb=500 
+#   population$p = sampling::inclusionprobabilities(population$M, nb)
+#   population$wts = 1/sampling::inclusionprobabilities(population$M, nb)
+#   
+#   beta1 = 0.5; beta2=1;
+#   population$Y0 = rnorm(N, beta1, 1)
+#   population$Y1 = rnorm(N, beta1 + beta2*population$X, 1)
+# 
+#   saveRDS(population, file = "population.RDS")
+  
+### data generation ###  
+  population = readRDS("population.RDS")
+  
+  truth = mean(population$Y1-population$Y0)
+  N = dim(population)[1]
+  
+#draw ref sample pps
+  nb = 500
+    sampb = pps::ppss(population$M, nb)
+    ref_sample = population[sampb,]
+    ref_sample$wts = N*ref_sample$wts/sum(ref_sample$wts)
+    
+    
+#draw RCT/nonprob (quasi-prob)
+    psi0r = -5.7
+    psi1r = 0.1
+    Pir = expit(psi0r+psi1r*log(population$M))
+    sampr = rbinom(N,1,Pir)  #* (population$X < 23) #exclude older than 65
+    np_sample = population[sampr,] 
+    nr<-sum(sampr)
+
+n<-nr+nb
+
+yb<-population$Y1[sampb] #ref treatment
+x1b<-population$X[sampb]
+
+
+y1r<-population$Y1[(sampr==1)]
+y0r<-population$Y0[(sampr==1)]
+
+
+ar<-rbinom(nr,1,.5) #randomized treatment
+
+yr<-y1r*ar+y0r*(1-ar) #observed outcome in the RCT
+x1r<-population$X[(sampr==1)]
+
+
+###RCT only###
+myxr<-x1r
+
+xcont<-myxr[(ar==0)]
+ycont<-yr[(ar==0)]
+xconttrain<-myxr[(ar==1)]
+outbartcont<-gbart(x.train=xcont,y.train=ycont,x.test=xconttrain,
+ndpost=1000,nskip=100,printevery=10000,keepevery=10) #train the model on the control group and predict the treatment group's outcome
+
+ycontcount<-outbartcont$yhat.test
+
+yrzr1<-t(matrix(rep(yr[(ar==1)],1000),sum(ar==1),1000))
+countdiffyr<-(yrzr1-ycontcount)%*%(rep(1/sum(ar==1),sum(ar==1))) #ATT
+
+rct<-c(mean(countdiffyr), sort(countdiffyr)[25], sort(countdiffyr)[975])
+
+###IPWT###
+
+myX = c(x1b,x1r)
+
+inrct = c(rep(0,nb),rep(1,nr))
+
+weight = c(ref_sample$wts,rep(1,nr)) #
+
+wr<-1/glm(inrct~myX,family=binomial,weight=weight)$fitted.values[(inrct==1)] #weighted glm
+
+countdiffyrw<-(yrzr1-ycontcount)%*%(wr[ar==1]/sum(wr[ar==1])) #treating wr as fixed
+
+ipwm = c(mean(countdiffyrw), sort(countdiffyrw)[25], sort(countdiffyrw)[975])
+
+#alternative weighting 1
+
+outbart_wts<-gbart(x.train=x1b, y.train=ref_sample$wts, x.test=x1r,
+ndpost=1000,nskip=100,printevery=10000,keepevery=10)
+
+wts_pred<-outbart_wts$yhat.test 
+
+outbartrct<-pbart(x.train=myX,y.train=inrct,
+ndpost=1000,nskip=100,printevery=10000,keepevery=10) #predict inclusion prob into R given (R + B)
+
+pirct<-pnorm(outbartrct$yhat.train)[,(nb+1):(nb+nr)]
+
+
+wr2<-wts_pred * (1 - pirct) / pirct
+
+
+countdiffyrw2<-diag((yrzr1-ycontcount)%*%t(wr2[,(ar==1)]))/
+(wr2[,(ar==1)]%*%rep(1,sum(ar==1)))
+
+ipwm2 = c(mean(countdiffyrw2), sort(countdiffyrw2)[25], sort(countdiffyrw2)[975])
+
+###Direct imputation###
+
+a<-c(rep(1,nb),ar) #observe Z=1 for all cases in B,
+myX<-cbind(a,c(x1b,x1r))
+
+myY<-c(yb,yr)
+
+xtrain<-myX[(inrct==1),]
+ytrain<-myY[(inrct==1)]
+xtest<-cbind(rep(0,n),myX[,2:length(myX[1,])]) #predict outcome of Z=0 for all cases in B and R
+outbart<-gbart(x.train=xtrain,y.train=ytrain,x.test=xtest,
+ndpost=1000,nskip=100,printevery=10000,keepevery=10) #Fit model to R, and predict all
+
+y<-c(yb,yr)
+
+y1<-y[(a==1)] #B + R[z==1]
+
+y0pred<-outbart$yhat.test[,(a==1)] #B + R[z==1]
+
+
+n1<-sum(a==1)
+inrct1<-inrct[(a==1)]
+wt = rep(1, n1)
+wt[inrct1==0] = ref_sample$wts -1 
+
+
+holddelt<-rep(0,200)
+holddeltv<-rep(0,200)
+for(m in 1:200){
+ty0pred<-y0pred[(m*5),]
+delta<-y1-ty0pred
+
+mydesign<-svydesign(ids=c(1:n1),weights=wt,variables=delta~1) #weighted mean of z==1, accounting for the sampling variability of w_B
+temp<-summary(svyglm(delta~1,design=mydesign))$coefficients
+holddelt[m]<-temp[1]
+holddeltv[m]<-temp[2]^2
+#print(m)
+}
+
+impm = c(mean(holddelt), mean(holddelt)-1.96*sqrt(mean(holddeltv)+1.005*var(holddelt)), #MI combining rules
+  mean(holddelt)+1.96*sqrt(mean(holddeltv)+1.005*var(holddelt)))
+
+
+paste0("TRUE: ", round(truth,3))
+paste0("RCT only: ", round(rct[1],3), " (", round(rct[2],3), ", ", round(rct[3],3), ")")
+paste0("IPW1: ", round(ipwm[1],3), " (", round(ipwm[2],3), ", ", round(ipwm[3],3), ")")
+paste0("IPW2: ", round(ipwm2[1],3), " (", round(ipwm2[2],3), ", ", round(ipwm2[3],3), ")")
+paste0("IMP: ", round(impm[1],3), " (", round(impm[2],3), ", ", round(impm[3],3), ")")
+
+```
